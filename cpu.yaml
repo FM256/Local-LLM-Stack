@@ -1,0 +1,34 @@
+services:
+  # The LLM Engine
+  llm-ollama:
+    image: ollama/ollama
+    container_name: llm-ollama
+    restart: unless-stopped
+    volumes:
+      - ollama-data:/root/.ollama
+    environment:
+      - OLLAMA_CONTEXT_LENGTH=32768   # Context length for when you run ollama from the terminal (webui will override it). Default of 4096 is relatively small
+    networks: # Reachable on port 11434
+      - llm-network
+
+  # A whisper server for local, private, speech-to-text support
+  # This one is a self-built container using the whisper.cpp. A custom entrypoint script provides the OpenAPI compatible REST interface.
+  # It has some advantages over hwdsl/whisper-server, including the cancelation of requests
+  llm-whisper:
+    image: llm-whisper:cpu
+    pull_policy: build
+    build:
+      context: ./whisper
+      dockerfile: Dockerfile.cpu
+    container_name: llm-whisper
+    environment:
+      MODEL_SIZE: small
+      WHISPER_THREADS: 8
+    ports:
+      - "127.0.0.1:9091:9091"
+    volumes:
+      - whisper-data:/app/models
+      - whisper-data:/root/.wespeaker
+    restart: unless-stopped
+    networks:
+      - llm-network

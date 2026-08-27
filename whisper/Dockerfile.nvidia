@@ -1,0 +1,46 @@
+FROM nvidia/cuda:12.3.1-devel-ubuntu22.04 AS builder
+
+# Build dependencies
+RUN apt-get update && apt-get install -y \
+    git \
+    cmake \
+    build-essential \
+    ffmpeg \
+    python3 \
+    python3-pip \
+    wget \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Build whisper.cpp with CUDA
+ARG CUDA_ARCHITECTURES="75;80;86;90"
+RUN ln -sf /usr/local/cuda/lib64/stubs/libcuda.so /usr/local/cuda/lib64/stubs/libcuda.so.1
+RUN git clone https://github.com/ggerganov/whisper.cpp.git . && \
+    mkdir build && cd build && \
+    cmake .. \
+        -DGGML_CUDA=ON \
+        -DCMAKE_CUDA_ARCHITECTURES=${CUDA_ARCHITECTURES} \
+        -DCMAKE_EXE_LINKER_FLAGS="-L/usr/local/cuda/lib64/stubs -Wl,-rpath-link,/usr/local/cuda/lib64/stubs" \
+        -DCMAKE_SHARED_LINKER_FLAGS="-L/usr/local/cuda/lib64/stubs -Wl,-rpath-link,/usr/local/cuda/lib64/stubs" && \
+    make -j$(nproc)
+
+# Download the model (default small, can be overridden at runtime)
+RUN /app/models/download-ggml-model.sh small /app/models
+
+# Install Python packages for the proxy
+RUN pip3 install --no-cache-dir fastapi uvicorn python-multipart requests httpx soundfile diarize \
+    && pip3 install --no-cache-dir torch torchaudio --index-url https://download.pytorch.org/whl/cpu
+
+# Copy proxy and entrypoint
+COPY openai_proxy.py /app/openai_proxy.py
+COPY entrypoint.sh /app/entrypoint.sh
+RUN chmod +x /app/entrypoint.sh
+
+# CUDA runtime environment (CUDA libs are already in /usr/local/cuda/lib64)
+# Add our built libraries to the path
+ENV LD_LIBRARY_PATH=/app/build:/usr/local/cuda/lib64
+ENV WHISPER_BACKEND=nvidia
+
+EXPOSE 9091
+ENTRYPOINT ["/app/entrypoint.sh"]

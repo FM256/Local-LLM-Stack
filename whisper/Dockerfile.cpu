@@ -1,0 +1,38 @@
+FROM ubuntu:22.04
+
+# Build dependencies
+RUN apt-get update && apt-get install -y \
+    git \
+    cmake \
+    build-essential \
+    ffmpeg \
+    python3 \
+    python3-pip \
+    wget \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Build whisper.cpp for CPU (no special flags)
+RUN git clone https://github.com/ggerganov/whisper.cpp.git . && \
+    mkdir build && cd build && \
+    cmake .. && \
+    make -j$(nproc)
+
+# Download the model (default small, can be overridden at runtime)
+RUN /app/models/download-ggml-model.sh small /app/models
+
+# Install Python packages for the proxy
+RUN pip3 install --no-cache-dir fastapi uvicorn python-multipart requests httpx soundfile diarize \
+    && pip3 install --no-cache-dir torch torchaudio --index-url https://download.pytorch.org/whl/cpu
+
+# Copy proxy and entrypoint
+COPY openai_proxy.py /app/openai_proxy.py
+COPY entrypoint.sh /app/entrypoint.sh
+RUN chmod +x /app/entrypoint.sh
+
+# No GPU-specific env vars
+ENV WHISPER_BACKEND=cpu
+
+EXPOSE 9091
+ENTRYPOINT ["/app/entrypoint.sh"]

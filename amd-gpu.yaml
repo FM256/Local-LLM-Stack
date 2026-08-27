@@ -1,0 +1,56 @@
+services:
+  llm-ollama:
+    image: ollama/ollama:rocm # For AMD graphics cards
+    container_name: llm-ollama
+    restart: unless-stopped
+    volumes:
+      - ollama-data:/root/.ollama
+    environment:
+      # NOTE: This is the config necessary when using an AMD Radeon RX 6600
+      # For other AMD graphics cards, you might need other configs depending on their generation / family.
+      # For example:
+      # RDNA 1 (Radeon RX 5000 series) - 10.1.0
+      # RDNA 2 (Radeon RX 6000 series) - 10.3.0
+      # RDNA 2 (Radeon 600M iGPU)      - 10.3.0
+      # RDNA 3 (Radeon RX 7000 series) - 11.0.0
+      # RDNA 3 (Ryzen 7000 iGPU)       - 11.0.3
+      # You can also run `find /opt/rocm/lib/rocblas/library -name 'Kernels.so-*'`. You will find
+      # the files end with strings like gfx1030. This can be translated into version 10.3.0. Try
+      # out the possible values and hopefully one will work.
+      # The rocminfo or rocm-smi tools can be used to find out your versions more conveniently. See
+      # llm.sh for a usage example, it uses it to automatically determine these versions
+      HSA_OVERRIDE_GFX_VERSION: ${HSA_OVERRIDE_GFX_VERSION}
+      OLLAMA_CONTEXT_LENGTH: 32768   # Context length for when you run ollama from the terminal (webui will override it). Default of 4096 is relatively small
+    # AMD users: Pass the graphic devices directly; will be accessed by the internal rocm
+    devices:
+      - /dev/kfd
+      - /dev/dri
+    networks: # Reachable on port 11434
+      - llm-network
+
+  # A whisper server for local, private, speech-to-text support
+  # This one is a self-built container using the whisper.cpp. A custom entrypoint script provides the OpenAPI compatible REST interface.
+  # It has some advantages over hwdsl/whisper-server, including the cancelation of requests
+  llm-whisper:
+    image: llm-whisper:rocm
+    pull_policy: build
+    build:
+      context: ./whisper
+      dockerfile: Dockerfile.rocm
+      args:
+        AMDGPU_TARGETS: ${AMDGPU_TARGETS}
+    container_name: llm-whisper
+    environment:
+      MODEL_SIZE: small
+      HSA_OVERRIDE_GFX_VERSION: ${HSA_OVERRIDE_GFX_VERSION}
+    devices:
+      - /dev/kfd
+      - /dev/dri
+    ports:
+      - "127.0.0.1:9091:9091"
+    volumes:
+      - whisper-data:/app/models
+      - whisper-data:/root/.wespeaker
+    restart: unless-stopped
+    networks: # 9091: OpenAPI compatible interface   8080: Internal whisper server interface
+      - llm-network

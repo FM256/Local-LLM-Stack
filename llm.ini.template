@@ -1,0 +1,55 @@
+# llm.ini – Global LLM System Configuration
+
+[general]
+# Defines the deployment profile used to select the default model pool during the initial setup phase.
+# Possible values: "cpu", "8gb", "40gb" (default: "8gb")
+setup_type = "8gb"
+
+[networking]
+# The port(s) for the web UI.
+# - "default": Listens on :80 and redirects to :443 (HTTPS).
+# - <number>: (e.g., "8080") Listen on that specific port with HTTPS only.
+bind_port = "default"
+
+# Whether to host the service publicly or locally.
+# true  -> Binds to localhost (127.0.0.1) only.
+# false -> Binds to all interfaces (0.0.0.0).
+local_only = "true"
+
+# List of hosts you will want to reach the service through (e.g. https://localhost:3000 -> localhost)
+# Must list all of them here; this will automatically configure caddy to offer the connections and
+# openwebui to have a safe CORS policy.
+# Note you also need to generate the server certificate for caddy to have these hosts for HTTPs to work
+hosts = "localhost;127.0.0.1;thinkpad-fm"
+
+[hardware_gpu]
+# Manual override for AMD GPU architecture detection used during Whisper audio model compilation.
+# Possible values: "gfx1030", "gfx1100", "gfx1010" (or leave empty for auto-detection)
+amd_gpu_target = ""
+
+# Manual override for NVIDIA CUDA compute capabilities used during Whisper build.
+# Possible values: "80", "75;86" or leave empty ("") to use Dockerfile defaults.
+cuda_architectures = ""
+
+[nvidia_mig]
+# In case NVIDIA MIG (Multi-Instance GPU) is enabled, you must assign specific MIG Instances (UUIDs)
+# to the containers instead of the card as a whole. MIGs are assigned one-to-one (MIG to container).
+# You can list the NVIDIA MIG UUIDs with nvidia-smi -L
+
+# MIG Device for ollama / llm backend
+mig_device_ollama = ""
+# MIG Device for whisper (used to transcribe audio)
+mig_device_whisper = ""
+
+[deployment]
+# Runs Docker Compose without 'sudo', relying on an existing rootless Docker daemon socket.
+rootless_mode = false
+
+# Enables Open WebUI authentication features and generates a temporary admin secret key.
+# When true, signups are initially enabled to allow admin account creation upon first login.
+# Possible values: "true", "false" (default)
+accounts_mode = false
+
+## Prevents the setup container from copying the `webui.db` configuration file on startup, thus letting you start with a mostly unconfigured webui without any user data
+## Possible values: "true", "false" (default)
+skip_db_copy = false

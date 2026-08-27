@@ -1,0 +1,15 @@
+caddy/ca.crt
+caddy/server.crt
+caddy/server.key
+caddy/caddy-ports.yaml
+caddy/Caddyfile
+
+setup/webui.db
+
+llm.ini
+llm.ini.*
+!llm.ini.template
+
+IMG/
+MODELS/
+mirror-to-server.sh
