@@ -25,8 +25,6 @@ MODEL_LISTS = {
         "gemma4:e4b",
         "gemma4:12b",
         "evalengine/unbound-e4b",
-        "qwen2.5-coder:latest",
-        "qwen3-coder:30b",
     ],
     "40gb": [
         "qwen2.5:3b",
