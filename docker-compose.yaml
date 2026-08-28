@@ -118,7 +118,7 @@ services:
   #  - OpenWebUI Built-Ins: Requires Hugging Face connection and GPU setup to download models; causes startup issues
   #  - Tei-Reranker container: Does a lot of "warmup" on startup, presumably to later serve requests
   #      faster. However, this makes multiple minutes of 100% CPU load. Ironically, my
-  #      custom-built container has lower latency even without any of the warmup nonsense
+  #      custom-built container has lower latency even without any of the warmup overhead
   #  - Ollama-based wrapper: You can also pull a reranker into ollama and try to build a wrapper
   #      container that provides the /rerank endpoint. But then you have to work in an unoptimized, text-based
   #      manner, the container is more complicated, and it frankly just wasn't practical (repeated ollama
@@ -180,9 +180,6 @@ services:
     restart: unless-stopped
     networks: # REST API reachable on port 8000
       - llm-network
-
-  # TODO: The memory / recall management
-  # TODO: The search and cache engine
 
 volumes:
   tts-cache:
