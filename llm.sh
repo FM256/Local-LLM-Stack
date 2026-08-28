@@ -312,10 +312,23 @@ GPU_TYPE=$(detect_gpu_type)
 echo "Detected GPU type: $GPU_TYPE" >&2
 
 if [[ "$GPU_TYPE" == "amd" ]]; then
-    if [[ -z "$AMD_GPU_TARGET" || "$AMD_GPU_TARGET" == "" ]]; then AMD_GPU_TARGET=$(detect_amd_gfx); fi
-    HSA_OVERRIDE="${AMD_GPU_TARGET/gfx/}"
+    # Determine AMDGPU_TARGETS (from config or auto‑detect)
+    if [[ -z "$AMD_GPU_TARGET" || "$AMD_GPU_TARGET" == "" ]]; then
+        AMD_GPU_TARGET=$(detect_amd_gfx)
+    fi
     export AMDGPU_TARGETS="$AMD_GPU_TARGET"
-    export HSA_OVERRIDE_GFX_VERSION="${HSA_OVERRIDE%.*}.0"
+
+    # Compute HSA_OVERRIDE_GFX_VERSION using regex
+    if [[ "$AMDGPU_TARGETS" =~ ^gfx([0-9]{2})([0-9]) ]]; then
+        MAJOR="${BASH_REMATCH[1]}"
+        MINOR="${BASH_REMATCH[2]}"
+        HSA_OVERRIDE_GFX_VERSION="${MAJOR}.${MINOR}.0"
+    else
+        # fallback
+        HSA_OVERRIDE_GFX_VERSION="10.3.0"
+    fi
+    export HSA_OVERRIDE_GFX_VERSION
+    echo "AMDGPU_TARGETS=$AMDGPU_TARGETS, HSA_OVERRIDE_GFX_VERSION=$HSA_OVERRIDE_GFX_VERSION" >&2
 fi
 
 if [[ -n "$CUDA_ARCHITECTURES" ]]; then export CUDA_ARCHITECTURES; fi
