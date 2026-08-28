@@ -2,8 +2,17 @@
 
 This project provides a fully-integrated local AI (LLM) deployment, ready to bring up with a simple `./llm.sh` command. It handles different modes of operation, such as rootless or rootful docker, AMD/NVIDIA/CPU hardware, professional NVIDIA MIG setups, binds to custom ports and redeployments with the same webui configuration (by copying the webui database).
 
-Much of the project was coded, in turn, with help of AI. However, code was always reviewed and diffed by a human before applying it to the codebase. Should any commits / pull requests to this project arise, it is expected that any AI-generated code is reviewed with similar scrutiny.
+## Integrated / Configured Features
 
+* Inference using ollama models (automatically downloaded based on your configured hardware profile)
+* User-friendly UI with persistent & temporary chats, overviews, advanced parameter settings, custom
+  model, skills and tools definitions, etc. (thanks to Open WebUI)
+* Text to Speech & Speech to Text support; Voice mode for chatting hands-free with the LLM
+* Flexible deployment with support for rootful and rootless docker, custom port bindings, database persistence across redeployments and simple autologin vs account-based authentication
+* Secure Deployment with CORS policy, HTTPs by default and restricted CA management
+* Support for both AMD and NVIDIA GPUs, including NVIDIA MIG support for professional GPU partitioning
+* Fully configured RAG pipeline with embedding (based on mxbai-embed-large in ollama) and reranking
+  (based on a custom reranking container).
 
 ## Major Components
 
@@ -61,3 +70,7 @@ any docker compose command, such as `./llm.sh down` or `./llm.sh restart llm-cad
 The first launch will take a while to build containers and finally launch open-webui. If you face
 internal server error, the Open WebUI might not be fully launched yet. Once you see the Open WebUI
 banner in your log output, you should be able to successfully connect through the browser.
+
+## Contributing / AI Policy
+
+This project was developed with AI assistance, with reviewing, diffing and validation done by humans. In case you want to contribute in a way that hinges on AI support, it is expected that you fully validate your code before submission.
