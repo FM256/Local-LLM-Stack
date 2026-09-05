@@ -31,6 +31,9 @@ WHISPER_SERVER_URL = "http://localhost:8080/inference"
 WHISPER_CLI = "/app/build/bin/whisper-cli"
 MODEL_PATH = "/app/models/ggml-small.bin"
 FFMPEG = "/usr/bin/ffmpeg"
+# These are the only formats supported by Whisper and Whisper CLI! Others must be reencoded accordingly.
+# Note that .wav is the native format whisper actually works with, so using this is the most
+# efficient, as otherwise it will re-encode internally, anyways
 SUPPORTED_EXTENSIONS = {".mp3", ".wav", ".flac", ".ogg"}
 
 
@@ -195,7 +198,8 @@ def transform_to_openai_verbose(
 
 async def convert_to_wav(input_path: str) -> str:
     """
-    Converts any audio file to a 16 kHz mono WAV using ffmpeg.
+    Converts any audio file to a 16 kHz mono WAV using ffmpeg. This is the native format whisper
+    will want to work with.
 
     Args:
         input_path: Path to the input audio file.

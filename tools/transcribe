@@ -22,6 +22,7 @@ import argparse
 import glob
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -110,7 +111,6 @@ def download_youtube_audio(url: str, output_dir: str) -> str:
     result = subprocess.run(cmd, capture_output=True, text=True, cwd=output_dir)
     if result.returncode != 0:
         raise RuntimeError(f"yt-dlp failed:\n{result.stderr}")
-    # Find the downloaded file (should be the only one matching audio.*)
     pattern = os.path.join(output_dir, "audio.*")
     files = glob.glob(pattern)
     if not files:
@@ -120,46 +120,108 @@ def download_youtube_audio(url: str, output_dir: str) -> str:
     return files[0]
 
 
-def convert_local_to_audio(file_path: str, output_dir: str) -> str:
+def get_ffaudio_path() -> str:
+    """Return path to ffaudio executable, either from FFAUDIO_PATH env or found in PATH."""
+    env_path = os.environ.get("FFAUDIO_PATH")
+    if env_path:
+        if os.path.isfile(env_path) and os.access(env_path, os.X_OK):
+            return env_path
+        raise RuntimeError(f"FFAUDIO_PATH points to non‑executable file: {env_path}")
+    which = shutil.which("ffaudio")
+    if which:
+        return which
+    raise RuntimeError("ffaudio not found. Install it or set FFAUDIO_PATH.")
+
+
+def extract_audio_with_ffaudio(input_file: str, output_dir: str) -> str:
+    """
+    Run ffaudio on input_file (must already be in output_dir or accessible).
+    Returns the path to the extracted audio file.
+    """
+    ff = get_ffaudio_path()
+    cmd = [ff, input_file]
+    log(f"Running: {' '.join(cmd)}")
+    result = subprocess.run(cmd, cwd=output_dir, capture_output=True, text=True)
+
+    if result.returncode != 0:
+        log(f"ffaudio stderr: {result.stderr}")
+        raise RuntimeError(f"ffaudio extraction failed (exit {result.returncode})")
+
+    # Parse the success line: "✅ Successfully extracted audio to '<path>'"
+    output_file = None
+    for line in result.stdout.splitlines():
+        if "Successfully extracted audio to" in line:
+            match = re.search(r"'([^']+)'", line)
+            if match:
+                output_file = match.group(1)
+                break
+
+    if not output_file:
+        raise RuntimeError("Could not determine extracted audio file from ffaudio output.")
+
+    if not os.path.isfile(output_file):
+        raise RuntimeError(f"Extracted audio file '{output_file}' not found.")
+    if not os.path.isabs(output_file):
+        output_file = os.path.join(output_dir, output_file)
+
+    log(f"Extracted audio: {output_file}")
+    return output_file
+
+
+def fallback_reencode_to_wav(input_file: str, output_dir: str) -> str:
+    """
+    Fallback: re‑encode input file to 16 kHz mono PCM WAV using ffmpeg.
+    Returns path to the WAV file.
+    """
     if not check_dependency("ffmpeg"):
-        raise RuntimeError("ffmpeg is not installed.")
-    base, ext = os.path.splitext(os.path.basename(file_path))
-    ext_lower = ext.lower()
-    audio_extensions = {".mp3", ".wav", ".m4a", ".flac", ".ogg", ".aac", ".opus"}
-    if ext_lower in audio_extensions:
-        dest = os.path.join(output_dir, os.path.basename(file_path))
-        shutil.copy2(file_path, dest)
-        return dest
-    out_mp3 = os.path.join(output_dir, f"{base}.mp3")
-    cmd_copy = ["ffmpeg", "-i", file_path, "-vn", "-c:a", "copy", "-y", out_mp3]
-    result = subprocess.run(cmd_copy, capture_output=True, text=True)
-    if result.returncode == 0 and os.path.isfile(out_mp3) and os.path.getsize(out_mp3) > 0:
-        return out_mp3
-    log("Copy failed, re‑encoding with libmp3lame.")
-    cmd_reencode = [
+        raise RuntimeError("ffmpeg is not installed, cannot fallback re‑encoding.")
+    base = os.path.splitext(os.path.basename(input_file))[0]
+    wav_path = os.path.join(output_dir, f"{base}.wav")
+    cmd = [
         "ffmpeg",
         "-i",
-        file_path,
+        input_file,
         "-vn",
+        "-ar",
+        "16000",
+        "-ac",
+        "1",
         "-c:a",
-        "libmp3lame",
-        "-b:a",
-        "192k",
+        "pcm_s16le",
         "-y",
-        out_mp3,
+        wav_path,
     ]
-    subprocess.run(cmd_reencode, check=True, capture_output=True)
-    return out_mp3
+    log(f"Fallback re‑encoding to WAV: {' '.join(cmd)}")
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(f"ffmpeg re‑encoding failed: {result.stderr}")
+    if not os.path.isfile(wav_path) or os.path.getsize(wav_path) == 0:
+        raise RuntimeError("ffmpeg produced empty or missing WAV file.")
+    return wav_path
 
 
 def obtain_audio(input_str: str, temp_dir: str) -> str:
     if is_url(input_str):
         log(f"Downloading audio from URL: {input_str}")
-        return download_youtube_audio(input_str, temp_dir)
+        downloaded = download_youtube_audio(input_str, temp_dir)
+        # Always run ffaudio; it handles already‑audio case safely.
+        return extract_audio_with_ffaudio(downloaded, temp_dir)
+
     if not os.path.isfile(input_str):
         raise FileNotFoundError(f"File not found: {input_str}")
-    log(f"Processing local file: {input_str}")
-    return convert_local_to_audio(input_str, temp_dir)
+
+    # Copy local file to temp_dir so everything stays together
+    dest = os.path.join(temp_dir, os.path.basename(input_str))
+    if os.path.abspath(input_str) != os.path.abspath(dest):
+        shutil.copy2(input_str, dest)
+        log(f"Copied local file to: {dest}")
+
+    log(f"Processing local file: {dest}")
+    try:
+        return extract_audio_with_ffaudio(dest, temp_dir)
+    except Exception as e:
+        log(f"ffaudio extraction failed: {e}. Falling back to re‑encoding.")
+        return fallback_reencode_to_wav(dest, temp_dir)
 
 
 def transcribe_file(

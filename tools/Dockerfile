@@ -32,6 +32,9 @@ RUN pacman -Scc --noconfirm
 COPY app.py /app/app.py
 COPY transcribe /usr/local/bin/transcriber
 RUN chmod +x /usr/local/bin/transcriber
+COPY ffaudio /usr/local/bin/ffaudio
+RUN chmod +x /usr/local/bin/ffaudio
+ENV FFAUDIO_PATH=/usr/local/bin/ffaudio
 
 WORKDIR /app
 EXPOSE 8000

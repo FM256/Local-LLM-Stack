@@ -1,0 +1,72 @@
+#!/bin/bash
+
+# Exit on unset variables, but we handle errors manually
+set -o pipefail
+
+input="$1"
+
+# 1. Check if argument is provided
+if [ -z "$input" ]; then
+    echo "Usage: $0 <media-file>"
+    exit 1
+fi
+
+# 2. Check if file exists
+if [ ! -f "$input" ]; then
+    echo "Error: File '$input' not found."
+    exit 1
+fi
+
+basename="${input%.*}"
+
+# 3. Count streams
+video_count=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_type -of default=noprint_wrappers=1:nokey=1 "$input" | wc -l)
+audio_count=$(ffprobe -v error -select_streams a:0 -show_entries stream=codec_type -of default=noprint_wrappers=1:nokey=1 "$input" | wc -l)
+
+# 4. If no audio stream at all, error out
+if [ "$audio_count" -eq 0 ]; then
+    echo "Error: No audio stream found in '$input'."
+    exit 1
+fi
+
+# 5. Detect codec of first audio stream
+codec=$(ffprobe -v error -select_streams a:0 -show_entries stream=codec_name \
+    -of default=noprint_wrappers=1:nokey=1 "$input" | tr -d '\n\r')
+
+# 6. Map codec to proper extension
+case "$codec" in
+aac) ext="m4a" ;;
+mp3) ext="mp3" ;;
+opus) ext="opus" ;;
+flac) ext="flac" ;;
+vorbis) ext="ogg" ;;
+pcm_s16le | pcm_s24le) ext="wav" ;;
+ac3) ext="ac3" ;;
+eac3) ext="eac3" ;;
+*) ext="mkv" ;; # Fallback: Matroska supports almost everything
+esac
+
+output_file="${basename}.${ext}"
+
+# 7. Critical safety check: if the output file is exactly the input file,
+#    then the input is already an audio file with the right extension.
+#    We just exit success without writing.
+if [ "$output_file" = "$input" ]; then
+    echo "✅ Successfully extracted audio to '$output_file' (already audio, no action needed)"
+    exit 0
+fi
+
+# 8. If output exists, we overwrite silently (non‑interactive)
+#    (No prompt, just overwrite with -y)
+
+# 9. Extract audio (no re‑encode)
+ffmpeg -i "$input" -vn -c:a copy -y "$output_file" 2>/dev/null
+
+# 10. Check success
+if [ $? -eq 0 ] && [ -f "$output_file" ] && [ -s "$output_file" ]; then
+    echo "✅ Successfully extracted audio to '$output_file'"
+    exit 0
+else
+    echo "❌ FFmpeg encountered an error. Check your input file."
+    exit 1
+fi
