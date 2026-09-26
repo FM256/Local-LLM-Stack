@@ -6,11 +6,10 @@ import tempfile
 from typing import Any, Dict, List, Optional
 
 import httpx
-import numpy as np
 import uvicorn
 from diarize import diarize
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 # ----------------------------------------------------------------------
 # Logging and Debug Flag
@@ -24,64 +23,69 @@ if DEBUG:
 
 app = FastAPI()
 
+
+def _sse(event: str, data: str) -> str:
+    """Format a Server-Sent Event. Multi-line data is split into one
+    'data:' line per source line, per the SSE spec."""
+    out = [f"event: {event}"]
+    for line in (data or "").split("\n"):
+        out.append(f"data: {line}")
+    out.append("")
+    out.append("")
+    return "\n".join(out)
+
 # ----------------------------------------------------------------------
 # Constants & paths
 # ----------------------------------------------------------------------
 WHISPER_SERVER_URL = "http://localhost:8080/inference"
 WHISPER_CLI = "/app/build/bin/whisper-cli"
 MODEL_PATH = "/app/models/ggml-small.bin"
+VAD_MODEL_PATH = "/app/models/ggml-silero-v5.1.2.bin"
 FFMPEG = "/usr/bin/ffmpeg"
 # These are the only formats supported by Whisper and Whisper CLI! Others must be reencoded accordingly.
 # Note that .wav is the native format whisper actually works with, so using this is the most
 # efficient, as otherwise it will re-encode internally, anyways
 SUPPORTED_EXTENSIONS = {".mp3", ".wav", ".flac", ".ogg"}
 
+# Anti-repetition / anti-hallucination flags for whisper-cli.
+#
+# The repetition-loop failure mode (one phrase emitted many times in a
+# row) is driven by decoder context carryover: once the model repeats,
+# the repeated text becomes context, raising the probability of another
+# repeat. `-mc 0` removes context carryover entirely, breaking the
+# feedback loop at the root. `-sns` suppresses non-speech tokens such
+# as [BLANK_AUDIO] and [MUSIC], which are themselves a frequent trigger.
+#
+# -et / -lpt / -nth are listed explicitly even though they currently
+# match upstream defaults, so we have one place to tune them if the A/B
+# run shows we need to be more aggressive.
+WHISPER_ANTI_REPETITION = [
+    "-mc", "0",
+    "-sns",
+    "-et", "2.4",
+    "-lpt", "-1.0",
+    "-nth", "0.6",
+]
+
+# Silero VAD pre-filtering. Whisper-cli segments the audio by speech
+# activity before decoding, so silent stretches never reach the decoder.
+# Silence is the primary trigger for hallucination loops: with no speech
+# to attend to, the model emits the highest-probability sequence, which
+# becomes context and self-reinforces. -mc 0 breaks that reinforcement
+# *after* a repeat begins; VAD prevents the first one.
+#
+# The model must be the GGML-converted Silero VAD weights — same model
+# the diarize library uses on the Python side, but transcoded into a
+# format whisper.cpp can load.
+WHISPER_VAD = [
+    "--vad",
+    "--vad-model", VAD_MODEL_PATH,
+]
+
 
 # ----------------------------------------------------------------------
 # Diarization helpers
 # ----------------------------------------------------------------------
-def find_optimal_clusters(embeddings: np.ndarray, max_speakers: int = 6) -> int:
-    """
-    Determines the optimal number of speaker clusters using silhouette score.
-
-    Args:
-        embeddings: A 2D numpy array of shape (n_samples, embedding_dim) containing
-            the voice embeddings for each time window.
-        max_speakers: The maximum number of clusters to evaluate. Defaults to 6.
-
-    Returns:
-        int: The optimal number of clusters between 2 and max_speakers (inclusive).
-            Returns 2 if the number of samples is too small or clustering fails.
-
-    Notes:
-        - Silhouette score is computed for each candidate cluster count.
-        - The count with the highest silhouette score is chosen.
-        - If only one speaker is present (or clustering fails), the function
-          gracefully returns 2 as a sensible default.
-    """
-    n_samples = embeddings.shape[0]
-    if n_samples < 3:
-        if DEBUG:
-            logger.debug(f"Too few embeddings ({n_samples}), defaulting to 2 speakers")
-        return 2
-    best_n = 2
-    best_score = -1.0
-    for n in range(2, min(max_speakers, n_samples) + 1):
-        clustering = AgglomerativeClustering(n_clusters=n)
-        labels = clustering.fit_predict(embeddings)
-        if len(set(labels)) < 2:
-            continue
-        score = silhouette_score(embeddings, labels)
-        if DEBUG:
-            logger.debug(f"Silhouette score for n={n}: {score:.4f}")
-        if score > best_score:
-            best_score = score
-            best_n = n
-    if DEBUG:
-        logger.debug(f"Optimal clusters: {best_n} (score {best_score:.4f})")
-    return best_n
-
-
 def run_diarization_and_merge(
     wav_path: str, transcription_segments: List[Dict[str, Any]], num_speakers: Optional[int] = None
 ) -> List[Dict[str, Any]]:
@@ -194,6 +198,31 @@ def transform_to_openai_verbose(
         "duration": duration,
         "segments": openai_segments,
     }
+
+
+def _group_by_speaker(segments: List[Dict[str, Any]]) -> List[tuple]:
+    """Merge consecutive segments belonging to the same speaker.
+
+    Used only for plain-text output, where a run of same-speaker
+    segments reads better as a single utterance than as a stack of
+    repeated speaker labels. JSON/SRT/VTT output is unaffected — those
+    formats legitimately need per-segment records.
+
+    Empty-text segments are dropped. Returns a list of
+    ``(speaker, text)`` pairs in original order.
+    """
+    grouped: List[tuple] = []
+    for seg in segments:
+        speaker = seg.get("speaker", "SPEAKER_00")
+        text = (seg.get("text") or "").strip()
+        if not text:
+            continue
+        if grouped and grouped[-1][0] == speaker:
+            prev_speaker, prev_text = grouped[-1]
+            grouped[-1] = (prev_speaker, f"{prev_text} {text}")
+        else:
+            grouped.append((speaker, text))
+    return grouped
 
 
 async def convert_to_wav(input_path: str) -> str:
@@ -353,11 +382,14 @@ async def transcribe(
                 logger.debug("Using whisper-cli (because diarize is true or native verbose format)")
 
             base_out = process_path
-            cmd = [WHISPER_CLI, "-m", MODEL_PATH, "-f", process_path]
-
-            # Add language hint if provided
-            if language:
-                cmd += ["-l", language]
+            # whisper-cli defaults to English if -l is omitted, which
+            # silently translates non-English audio. Always pass -l,
+            # falling back to 'auto' so detection actually runs.
+            cmd = [
+                WHISPER_CLI, "-m", MODEL_PATH, "-f", process_path,
+                "-l", language or "auto",
+                *WHISPER_VAD, *WHISPER_ANTI_REPETITION,
+            ]
 
             # Determine CLI output format
             if response_format == "srt":
@@ -467,13 +499,11 @@ async def transcribe(
                 if response_format == "text" and diarize and segments:
                     collapse_bool = collapse.lower() in ("true", "1", "yes")
                     lines = []
-                    for seg in segments:
-                        speaker = seg.get("speaker", "SPEAKER_00")
-                        text = seg.get("text", "")
+                    for speaker, text in _group_by_speaker(segments):
                         if collapse_bool:
                             text = " ".join(text.split())
                         lines.append(f"{speaker}:\n{text}")
-                    # Join segments with a newline between them (no extra blank lines)
+                    # Join merged speaker turns with a blank line between them
                     output_text = "\n\n".join(lines)
                     return Response(content=output_text, media_type="text/plain")
 
@@ -577,6 +607,430 @@ async def transcribe(
                     os.unlink(base + ext)
                 except:
                     pass
+
+
+class _SSELogHandler(logging.Handler):
+    """Logging handler that forwards records to an asyncio queue.
+
+    Safe to use from any thread; the actual queue mutation happens on
+    the target event loop via ``call_soon_threadsafe``.  Used to bridge
+    log records from the (thread-based) diarization pipeline into the
+    SSE progress stream.  See the ``_stream_cli`` diarization block for
+    where this is installed and torn down.
+    """
+
+    def __init__(self, loop: asyncio.AbstractEventLoop, queue: "asyncio.Queue[Any]"):
+        super().__init__()
+        self._loop = loop
+        self._queue = queue
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            msg = self.format(record)
+        except Exception:
+            return
+        try:
+            self._loop.call_soon_threadsafe(self._queue.put_nowait, msg)
+        except RuntimeError:
+            # Loop closed — drop silently during interpreter shutdown.
+            pass
+
+
+@app.post("/v1/audio/transcriptions/stream")
+async def transcribe_stream(
+    request: Request,
+    file: UploadFile = File(...),
+    model: str = Form("whisper-1"),
+    language: str = Form(None),
+    response_format: str = Form("json"),
+    temperature: float = Form(0.0),
+    collapse: str = Form("true"),
+    diarize: bool = Form(False),
+    num_speakers: Optional[int] = Form(None),
+):
+    """
+    Streaming variant of /v1/audio/transcriptions.
+
+    Returns Server-Sent Events:
+      - event: progress  data: <line>       (many)
+      - event: result    data: <payload>    (exactly one, on success)
+      - event: error     data: <message>    (zero or one, on failure)
+
+    Payload semantics match the non-streaming endpoint for the same
+    response_format: JSON string for json/verbose_json, plain text for
+    text, subtitle content for srt/vtt.
+    """
+    logger.info(
+        f"NEW STREAM REQUEST: file={file.filename} fmt={response_format} "
+        f"diarize={diarize} num_speakers={num_speakers}"
+    )
+    return StreamingResponse(
+        _stream_transcribe(
+            request, file, language, response_format, temperature,
+            collapse, diarize, num_speakers,
+        ),
+        media_type="text/event-stream",
+    )
+
+
+async def _stream_transcribe(
+    request, file, language, response_format, temperature,
+    collapse, diarize, num_speakers,
+):
+    """Async generator producing SSE events for a streaming transcription."""
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".tmp") as tmp:
+        content = await file.read()
+        tmp.write(content)
+        tmp_path = tmp.name
+
+    original_filename = file.filename or "audio"
+    ext = os.path.splitext(original_filename)[1].lower()
+    process_path = None
+    try:
+        if ext not in SUPPORTED_EXTENSIONS:
+            yield _sse("progress", f"🎵 Converting '{ext or 'unknown'}' to WAV...")
+            try:
+                process_path = await convert_to_wav(tmp_path)
+            except HTTPException as e:
+                yield _sse("error", f"Conversion failed: {e.detail}")
+                return
+            os.unlink(tmp_path)
+        else:
+            process_path = tmp_path + ext
+            os.rename(tmp_path, process_path)
+
+        use_cli = response_format in ("srt", "vtt", "verbose_json") or (
+            response_format in ("json", "text") and diarize
+        )
+
+        if use_cli:
+            yield _sse("progress", "🎧 Preparing transcription (model load + VAD)...")
+            async for ev in _stream_cli(
+                request, process_path, language, response_format,
+                diarize, num_speakers, collapse,
+            ):
+                yield ev
+        else:
+            async for ev in _stream_server(
+                request, process_path, language, response_format,
+                temperature, collapse,
+            ):
+                yield ev
+
+    except asyncio.CancelledError:
+        logger.warning("Stream request cancelled")
+        raise
+    except Exception as e:
+        logger.exception("Streaming transcribe failed")
+        yield _sse("error", f"Internal error: {e}")
+    finally:
+        for p in [tmp_path, process_path]:
+            if p and os.path.exists(p):
+                try:
+                    os.unlink(p)
+                except Exception:
+                    pass
+        if process_path:
+            base = os.path.splitext(process_path)[0]
+            for suffix in (".srt", ".vtt", ".json"):
+                p = base + suffix
+                if os.path.exists(p):
+                    try:
+                        os.unlink(p)
+                    except Exception:
+                        pass
+
+
+async def _stream_cli(
+    request, process_path, language, response_format,
+    diarize, num_speakers, collapse,
+):
+    """whisper-cli + optional diarization, streaming progress as SSE."""
+    base_out = process_path
+    # whisper-cli defaults to English if -l is omitted, which silently
+    # translates non-English audio. Always pass -l, falling back to
+    # 'auto' so detection actually runs.
+    cmd = [
+        WHISPER_CLI, "-m", MODEL_PATH, "-f", process_path,
+        "-l", language or "auto",
+        *WHISPER_VAD, *WHISPER_ANTI_REPETITION,
+    ]
+    if response_format == "srt":
+        cmd += ["-osrt", "-of", base_out]
+    elif response_format == "vtt":
+        cmd += ["-ovtt", "-of", base_out]
+    else:
+        cmd += ["-oj", "-of", base_out]
+
+    logger.info(f"Streaming whisper-cli: {' '.join(cmd)}")
+    process = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+
+    stdout_queue: asyncio.Queue = asyncio.Queue()
+
+    async def _pump_stdout():
+        try:
+            while True:
+                line = await process.stdout.readline()
+                if not line:
+                    break
+                await stdout_queue.put(line)
+        finally:
+            await stdout_queue.put(None)
+
+    async def _drain_stderr() -> bytes:
+        chunks = []
+        while True:
+            chunk = await process.stderr.readline()
+            if not chunk:
+                break
+            chunks.append(chunk)
+        return b"".join(chunks)
+
+    stdout_task = asyncio.create_task(_pump_stdout())
+    stderr_task = asyncio.create_task(_drain_stderr())
+
+    try:
+        while True:
+            if await request.is_disconnected():
+                process.kill()
+                await process.wait()
+                yield _sse("error", "Client disconnected")
+                return
+            try:
+                line_bytes = await asyncio.wait_for(stdout_queue.get(), timeout=15.0)
+            except asyncio.TimeoutError:
+                yield _sse("progress", "⏳ (transcribing...)")
+                continue
+            if line_bytes is None:
+                break
+            line = line_bytes.decode("utf-8", errors="replace").rstrip("\r\n")
+            if line:
+                yield _sse("progress", line)
+        await process.wait()
+        stderr_data = await stderr_task
+    finally:
+        if process.returncode is None:
+            try:
+                process.kill()
+                await process.wait()
+            except Exception:
+                pass
+        if not stdout_task.done():
+            stdout_task.cancel()
+
+    if process.returncode != 0:
+        err_msg = stderr_data.decode("utf-8", errors="replace")
+        yield _sse("error", f"whisper-cli exited with {process.returncode}:\n{err_msg}")
+        return
+
+    if response_format == "srt":
+        output_file = base_out + ".srt"
+        if not os.path.exists(output_file):
+            yield _sse("error", "SRT file not produced")
+            return
+        yield _sse("progress", "✅ Transcription done.")
+        with open(output_file, "r") as f:
+            yield _sse("result", f.read())
+        return
+    if response_format == "vtt":
+        output_file = base_out + ".vtt"
+        if not os.path.exists(output_file):
+            yield _sse("error", "VTT file not produced")
+            return
+        yield _sse("progress", "✅ Transcription done.")
+        with open(output_file, "r") as f:
+            yield _sse("result", f.read())
+        return
+
+    output_file = base_out + ".json"
+    if os.path.exists(output_file):
+        with open(output_file, "r") as f:
+            raw_output = f.read()
+    else:
+        yield _sse("error", "whisper-cli did not produce JSON output")
+        return
+
+    try:
+        cli_data = json.loads(raw_output)
+    except json.JSONDecodeError as e:
+        yield _sse("error", f"Invalid JSON from whisper-cli: {e}")
+        return
+
+    detected_lang = cli_data.get("result", {}).get("language", "auto")
+    transcription_entries = cli_data.get("transcription", [])
+    segments = []
+    full_text_parts = []
+    for entry in transcription_entries:
+        ts = entry.get("timestamps", {})
+        start_str = ts.get("from", "00:00:00,000")
+        end_str = ts.get("to", "00:00:00,000")
+        start = parse_timestamp(start_str)
+        end = parse_timestamp(end_str)
+        text = entry.get("text", "").strip()
+        if text:
+            segments.append({"start": start, "end": end, "text": text})
+            full_text_parts.append(text)
+
+    full_text = " ".join(full_text_parts)
+    if not segments and "text" in cli_data:
+        full_text = cli_data["text"]
+        segments = [{"start": 0.0, "end": 0.0, "text": full_text}]
+
+    yield _sse("progress", "✅ Transcription done.")
+
+    if diarize and segments:
+        yield _sse("progress", f"🎙️ Starting diarization ({len(segments)} segments)...")
+
+        # Bridge the diarize library's logging into our SSE stream.  The
+        # library emits one progress record every N embedding windows
+        # (see PROGRESS_EVERY in diarize/embeddings.py), which is where
+        # virtually all the wall-clock time goes.  Records go from worker
+        # threads -> call_soon_threadsafe -> log_queue -> here.
+        loop = asyncio.get_running_loop()
+        log_queue: "asyncio.Queue[Any]" = asyncio.Queue()
+        _SENTINEL = object()
+
+        diar_handler = _SSELogHandler(loop, log_queue)
+        diar_handler.setLevel(logging.INFO)
+        diar_handler.setFormatter(logging.Formatter("%(message)s"))
+
+        diar_logger = logging.getLogger("diarize")
+        prior_level = diar_logger.level
+        diar_logger.addHandler(diar_handler)
+        if prior_level == logging.NOTSET or prior_level > logging.INFO:
+            diar_logger.setLevel(logging.INFO)
+
+        try:
+            diar_task = loop.run_in_executor(
+                None, run_diarization_and_merge, process_path, segments, num_speakers
+            )
+
+            # Sentinel marks end-of-stream so we don't wait a full 15s
+            # timeout after the task actually finishes.
+            def _on_done(_fut):
+                try:
+                    loop.call_soon_threadsafe(log_queue.put_nowait, _SENTINEL)
+                except RuntimeError:
+                    pass
+
+            diar_task.add_done_callback(_on_done)
+
+            while True:
+                if await request.is_disconnected():
+                    # The worker thread cannot be cancelled; it will
+                    # finish in the background.  The finally block below
+                    # detaches our handler so its records stop arriving.
+                    yield _sse("error", "Client disconnected")
+                    return
+                try:
+                    item = await asyncio.wait_for(log_queue.get(), timeout=15.0)
+                except asyncio.TimeoutError:
+                    yield _sse("progress", "⏳ (diarizing...)")
+                    continue
+                if item is _SENTINEL:
+                    break
+                yield _sse("progress", item)
+
+            # Drain anything that raced the sentinel.
+            while not log_queue.empty():
+                item = log_queue.get_nowait()
+                if item is not _SENTINEL:
+                    yield _sse("progress", item)
+
+            try:
+                segments = await diar_task
+                yield _sse("progress", "✅ Diarization done.")
+            except Exception as e:
+                logger.exception("Diarization failed")
+                yield _sse("progress", f"⚠️ Diarization failed: {e}")
+                segments = [
+                    {"start": s["start"], "end": s["end"], "text": s["text"]}
+                    for s in segments
+                ]
+        finally:
+            diar_logger.removeHandler(diar_handler)
+            diar_logger.setLevel(prior_level)
+
+    openai_result = transform_to_openai_verbose(full_text, segments, detected_lang)
+
+    if response_format in ("json", "verbose_json"):
+        yield _sse("result", json.dumps(openai_result))
+        return
+
+    if response_format == "text":
+        if diarize and segments:
+            collapse_bool = collapse.lower() in ("true", "1", "yes")
+            lines = []
+            for speaker, text in _group_by_speaker(segments):
+                if collapse_bool:
+                    text = " ".join(text.split())
+                lines.append(f"{speaker}:\n{text}")
+            yield _sse("result", "\n\n".join(lines))
+            return
+        else:
+            yield _sse("result", openai_result["text"])
+            return
+
+    yield _sse("error", f"Unsupported response_format: {response_format}")
+
+
+async def _stream_server(
+    request, process_path, language, response_format, temperature, collapse,
+):
+    """whisper-server POST with heartbeat SSE while waiting."""
+    with open(process_path, "rb") as f:
+        files = {"file": (os.path.basename(process_path), f, "audio/mpeg")}
+        data = {"response-format": "json"}
+        if temperature is not None:
+            data["temperature"] = str(temperature)
+        if language is not None:
+            data["language"] = language
+
+        async with httpx.AsyncClient(timeout=600.0) as client:
+            send_task = asyncio.create_task(
+                client.post(WHISPER_SERVER_URL, files=files, data=data)
+            )
+            try:
+                while True:
+                    if await request.is_disconnected():
+                        send_task.cancel()
+                        yield _sse("error", "Client disconnected")
+                        return
+                    try:
+                        resp = await asyncio.wait_for(asyncio.shield(send_task), timeout=15.0)
+                        break
+                    except asyncio.TimeoutError:
+                        yield _sse("progress", "⏳ (transcribing...)")
+                        continue
+            except asyncio.CancelledError:
+                send_task.cancel()
+                raise
+            resp = await send_task
+
+    if resp.status_code != 200:
+        yield _sse("error", f"Whisper server returned {resp.status_code}: {resp.text[:200]}")
+        return
+
+    yield _sse("progress", "✅ Transcription done.")
+
+    try:
+        server_data = resp.json()
+    except Exception:
+        server_data = {"text": resp.text.strip()}
+
+    if response_format == "json":
+        yield _sse("result", json.dumps(server_data))
+        return
+    else:
+        transcription = server_data.get("text", resp.text.strip())
+        if collapse.lower() in ("true", "1", "yes"):
+            transcription = " ".join(transcription.split())
+        yield _sse("result", transcription)
+        return
 
 
 @app.post("/v1/audio/translations")

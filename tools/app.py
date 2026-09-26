@@ -13,7 +13,7 @@ import tempfile
 import traceback
 
 import uvicorn
-from fastapi import FastAPI, File, HTTPException, Request, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
@@ -107,7 +107,10 @@ async def run_transcriber(request: Request, args: list, source_desc: str, cleanu
                 return
 
             logger.info(f"Transcription successful for {source_desc} (length: {len(stdout)} chars)")
-            yield f"event: result\ndata: {stdout}\n\n"
+            yield "event: result\n"
+            for line in stdout.splitlines():
+                yield f"data: {line}\n"
+            yield "\n"
 
         except asyncio.CancelledError:
             logger.warning(f"Generator cancelled for {source_desc} – killing subprocess")
@@ -132,6 +135,8 @@ async def run_transcriber(request: Request, args: list, source_desc: str, cleanu
 # ---------- Endpoint: YouTube URL ----------
 class TranscribeRequest(BaseModel):
     url: str
+    diarize: bool = False
+    num_speakers: int = None
 
 
 @app.post("/transcribe")
@@ -139,21 +144,37 @@ async def transcribe(request: Request, transcribe_req: TranscribeRequest):
     """
     Accepts a YouTube URL, runs the transcriber script, and streams progress.
     """
-    logger.info(f"Received transcription request for URL: {transcribe_req.url}")
+    logger.info(
+        f"Received transcription request for URL: {transcribe_req.url} "
+        f"(diarize={transcribe_req.diarize}, num_speakers={transcribe_req.num_speakers})"
+    )
+    args = [transcribe_req.url, "--server", "http://llm-whisper:9091"]
+    if transcribe_req.diarize:
+        args.append("--diarize")
+        if transcribe_req.num_speakers is not None:
+            args.extend(["--num-speakers", str(transcribe_req.num_speakers)])
     return await run_transcriber(
         request,
-        [transcribe_req.url, "--server", "http://llm-whisper:9091"],
+        args,
         f"URL {transcribe_req.url}",
     )
 
 
 # ---------- Endpoint: File Upload ----------
 @app.post("/transcribe_file")
-async def transcribe_file(request: Request, file: UploadFile = File(...)):
+async def transcribe_file(
+    request: Request,
+    file: UploadFile = File(...),
+    diarize: bool = Form(False),
+    num_speakers: int = Form(None),
+):
     """
     Accepts an uploaded audio/video file, saves it temporarily, and streams transcription progress.
     """
-    logger.info(f"Received file upload: {file.filename} (content-type: {file.content_type})")
+    logger.info(
+        f"Received file upload: {file.filename} (content-type: {file.content_type}, "
+        f"diarize={diarize}, num_speakers={num_speakers})"
+    )
 
     tmpdir = tempfile.mkdtemp(prefix="transcriber_")
     try:
@@ -166,9 +187,15 @@ async def transcribe_file(request: Request, file: UploadFile = File(...)):
             f"Saved uploaded file to {file_path} (size: {os.path.getsize(file_path)} bytes)"
         )
 
+        args = [file_path, "--server", "http://llm-whisper:9091"]
+        if diarize:
+            args.append("--diarize")
+            if num_speakers is not None:
+                args.extend(["--num-speakers", str(num_speakers)])
+
         return await run_transcriber(
             request,
-            [file_path, "--server", "http://llm-whisper:9091"],
+            args,
             f"uploaded file {file.filename}",
             cleanup_dir=tmpdir,
         )

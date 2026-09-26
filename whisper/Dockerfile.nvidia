@@ -25,12 +25,27 @@ RUN git clone https://github.com/ggerganov/whisper.cpp.git . && \
         -DCMAKE_SHARED_LINKER_FLAGS="-L/usr/local/cuda/lib64/stubs -Wl,-rpath-link,/usr/local/cuda/lib64/stubs" && \
     make -j$(nproc)
 
-# Download the model (default small, can be overridden at runtime)
+# Download the model (default small, can be overridden at runtime).
+# The Silero VAD model is downloaded at container start (see entrypoint.sh)
+# rather than baked into the image, because /app/models is a runtime volume
+# that would shadow anything copied into that path at build time.
 RUN /app/models/download-ggml-model.sh small /app/models
 
-# Install Python packages for the proxy
-RUN pip3 install --no-cache-dir fastapi uvicorn python-multipart requests httpx soundfile diarize \
+# Patch-independent Python packages for the proxy.  Installed before the
+# diarize-patches COPY so that editing the patch does not invalidate the
+# (expensive) torch install layer.
+RUN pip3 install --no-cache-dir fastapi uvicorn python-multipart requests httpx soundfile \
     && pip3 install --no-cache-dir torch torchaudio --index-url https://download.pytorch.org/whl/cpu
+
+# diarize is installed from a pinned upstream checkout with a local patch
+# applied at build time (parallel embedding extraction) — see
+# whisper/diarize-patches/.  Changing the patch only invalidates this layer.
+ARG DIARIZE_REF=v0.1.2
+COPY diarize-patches /tmp/diarize-patches
+RUN git clone --depth 1 --branch "${DIARIZE_REF}" https://github.com/notch-up/diarize.git /tmp/diarize \
+    && cp /tmp/diarize-patches/embeddings.py /tmp/diarize/src/diarize/embeddings.py \
+    && pip3 install --no-cache-dir /tmp/diarize \
+    && rm -rf /tmp/diarize /tmp/diarize-patches
 
 # Copy proxy and entrypoint
 COPY openai_proxy.py /app/openai_proxy.py

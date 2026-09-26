@@ -27,12 +27,15 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 from urllib.parse import urlparse
 
 import requests
 
 DEFAULT_SERVER = "http://localhost:9091"
 TRANSCRIPT_ENDPOINT = "/v1/audio/transcriptions"
+STREAM_ENDPOINT = "/v1/audio/transcriptions/stream"
 
 
 def is_url(string: str) -> bool:
@@ -140,7 +143,6 @@ def extract_audio_with_ffaudio(input_file: str, output_dir: str) -> str:
     """
     ff = get_ffaudio_path()
     cmd = [ff, input_file]
-    log(f"Running: {' '.join(cmd)}")
     result = subprocess.run(cmd, cwd=output_dir, capture_output=True, text=True)
 
     if result.returncode != 0:
@@ -164,7 +166,7 @@ def extract_audio_with_ffaudio(input_file: str, output_dir: str) -> str:
     if not os.path.isabs(output_file):
         output_file = os.path.join(output_dir, output_file)
 
-    log(f"Extracted audio: {output_file}")
+    log(f"🎵 Extracted audio: {os.path.basename(output_file)}")
     return output_file
 
 
@@ -202,7 +204,7 @@ def fallback_reencode_to_wav(input_file: str, output_dir: str) -> str:
 
 def obtain_audio(input_str: str, temp_dir: str) -> str:
     if is_url(input_str):
-        log(f"Downloading audio from URL: {input_str}")
+        log(f"📥 Downloading audio from URL: {input_str}")
         downloaded = download_youtube_audio(input_str, temp_dir)
         # Always run ffaudio; it handles already‑audio case safely.
         return extract_audio_with_ffaudio(downloaded, temp_dir)
@@ -214,9 +216,7 @@ def obtain_audio(input_str: str, temp_dir: str) -> str:
     dest = os.path.join(temp_dir, os.path.basename(input_str))
     if os.path.abspath(input_str) != os.path.abspath(dest):
         shutil.copy2(input_str, dest)
-        log(f"Copied local file to: {dest}")
 
-    log(f"Processing local file: {dest}")
     try:
         return extract_audio_with_ffaudio(dest, temp_dir)
     except Exception as e:
@@ -251,6 +251,275 @@ def transcribe_file(
     if resp.status_code != 200:
         raise RuntimeError(f"Server returned {resp.status_code}: {resp.text}")
     return resp.text
+
+
+#: Matches whisper-cli segment lines: "[HH:MM:SS.mmm --> HH:MM:SS.mmm] text"
+#: (whisper.cpp uses '.'; older/other builds use ','). We only need the
+#: end timestamp to compute a percent against the total audio duration.
+_SEGMENT_END_RE = re.compile(
+    r"^\[\d+:\d+:\d+[.,]\d+\s*-->\s*"
+    r"(\d+):(\d+):(\d+)[.,](\d+)\]"
+)
+
+
+def _format_duration(seconds: float) -> str:
+    """Format a duration as '1h 2m 3s', trimming leading zero units."""
+    s = int(seconds)
+    h, rem = divmod(s, 3600)
+    m, sec = divmod(rem, 60)
+    if h:
+        return f"{h}h {m}m {sec}s"
+    if m:
+        return f"{m}m {sec}s"
+    return f"{sec}s"
+
+
+class ProgressReporter:
+    """Displays transcription progress on stderr.
+
+    Two kinds of messages are handled:
+
+    * **Persistent**: real progress lines (transcript segments, phase
+      transitions such as "Converting ..." or "Running diarization ...").
+      Printed once and left on screen.
+    * **Ephemeral**: heartbeat markers from the server ("⏳ ..."). In TTY
+      mode these do not print as their own line; they only bump the
+      "last activity" timestamp, and the bottom status line reflects
+      liveness. In pipe mode they are forwarded as plain lines so
+      downstream consumers (app.py) still see periodic liveness signals
+      and can keep their SSE connection warm.
+
+    On a TTY, a bottom status line is continuously updated in place.
+    Its content depends on what we know:
+
+      [Heartbeat Alive (Xs ago)]
+      [Transcription | Heartbeat Alive (Xs ago)]
+      [Transcription at 42% | Heartbeat Alive (Xs ago)]
+      [Diarization at 63% | Heartbeat Alive (Xs ago)]
+      [Diarization at 63% | Heartbeat Missed! (last 34s ago)]
+
+    The percent for transcription is derived from the last whisper-cli
+    segment timestamp seen and the total audio duration (both known to
+    the caller). The percent for diarization is derived from the
+    "embedding N/M" lines emitted by the patched diarize library and
+    forwarded by the SSE bridge. When neither is available (e.g. the
+    whisper-server path with no per-segment output), the percent is
+    omitted and only the phase label is shown.
+    """
+
+    #: Server-side keep-alive markers. Anything starting with this prefix
+    #: is treated as ephemeral (status-line only, no new line printed).
+    HEARTBEAT_PREFIX = "⏳"
+
+    def __init__(
+        self,
+        heartbeat_interval: float = 15.0,
+        total_duration: float = 0.0,
+        start_time: float | None = None,
+    ):
+        self.heartbeat_interval = heartbeat_interval
+        self.total_duration = float(total_duration) if total_duration else 0.0
+        self.tty = sys.stderr.isatty()
+        self._lock = threading.Lock()
+        self._last_event = time.monotonic()
+        self._running = True
+        self._start_time = start_time if start_time is not None else time.monotonic()
+        # Phase/percent are inferred from progress messages. Initial
+        # phase is Transcription; percent is 0 if we know the duration,
+        # None otherwise (we'll render "Transcription" without a %).
+        self._phase: str | None = "Transcription"
+        self._percent: float | None = 0.0 if self.total_duration > 0 else None
+        self._thread = threading.Thread(target=self._status_loop, daemon=True)
+        if self.tty:
+            self._thread.start()
+
+    def _update_progress_from_message(self, message: str) -> None:
+        """Parse phase/percent hints from a progress message.
+
+        Caller must hold ``self._lock``. Unrecognised messages are
+        ignored (they're still printed/forwarded normally).
+        """
+        # Diarization embedding counter from the patched library:
+        # "embedding N/M". No emoji prefix; this comes straight from
+        # the diarize logger via the SSE bridge.
+        m = re.match(r"^embedding (\d+)/(\d+)\s*$", message)
+        if m:
+            n, total_n = int(m.group(1)), int(m.group(2))
+            self._phase = "Diarization"
+            self._percent = 100.0 * n / total_n if total_n > 0 else None
+            return
+
+        # Phase transition markers emitted by openai_proxy.py.
+        if message.startswith("🎙️"):
+            self._phase = "Diarization"
+            self._percent = 0.0
+            return
+        if message.startswith("🎵"):
+            self._phase = "Transcription"
+            self._percent = 0.0 if self.total_duration > 0 else None
+            return
+
+        # whisper-cli segment line — compute transcript progress.
+        m = _SEGMENT_END_RE.match(message)
+        if m and self.total_duration > 0:
+            h, mm, ss, ms = (int(x) for x in m.groups())
+            end = h * 3600 + mm * 60 + ss + ms / 1000.0
+            pct = max(0.0, min(100.0, 100.0 * end / self.total_duration))
+            self._phase = "Transcription"
+            # Do not regress; segment timestamps can jitter by a few ms
+            # at window boundaries.
+            if self._percent is None or pct >= self._percent:
+                self._percent = pct
+            return
+
+    def _render_status_locked(self) -> None:
+        """Draw the bottom status line. Caller must hold ``self._lock``."""
+        elapsed = time.monotonic() - self._last_event
+        if elapsed > self.heartbeat_interval * 2:
+            hb = f"Heartbeat Missed! (last {int(elapsed)}s ago)"
+        else:
+            hb = f"Heartbeat Alive ({int(elapsed)}s ago)"
+
+        elapsed_str = _format_duration(time.monotonic() - self._start_time)
+        tail = f"{hb} | Elapsed {elapsed_str}"
+
+        if self._phase is not None and self._percent is not None:
+            status = f"[{self._phase} at {int(self._percent)}% | {tail}]"
+        elif self._phase is not None:
+            status = f"[{self._phase} | {tail}]"
+        else:
+            status = f"[{tail}]"
+
+        sys.stderr.write(f"\r\033[K{status}")
+        sys.stderr.flush()
+
+    def progress(self, message: str) -> None:
+        with self._lock:
+            self._last_event = time.monotonic()
+            self._update_progress_from_message(message)
+            if not self.tty:
+                # Pipe mode: forward everything verbatim so the parent
+                # process sees regular lines on stderr.
+                sys.stderr.write(f"{message}\n")
+                sys.stderr.flush()
+                return
+            if message.startswith(self.HEARTBEAT_PREFIX):
+                # Ephemeral: redraw the status line with the fresh
+                # timestamp. Do not print the message itself.
+                self._render_status_locked()
+                return
+            # Persistent: clear the bottom line, print the message, then
+            # redraw the bottom line *in the same critical section* so
+            # there is no visible gap between the two writes.
+            sys.stderr.write("\r\033[K")
+            sys.stderr.write(f"{message}\n")
+            sys.stderr.flush()
+            self._render_status_locked()
+
+    def _status_loop(self) -> None:
+        while self._running:
+            time.sleep(1.0)
+            with self._lock:
+                self._render_status_locked()
+
+    def stop(self) -> None:
+        """Stop the status thread and clear the live status line."""
+        self._running = False
+        if self.tty:
+            self._thread.join(timeout=2.0)
+            with self._lock:
+                sys.stderr.write("\r\033[K")
+                sys.stderr.flush()
+
+    def finalize(self, audio_duration: float, diarized: bool) -> None:
+        """Stop the status thread and print a final summary line to stderr.
+
+        Combines what ``stop()`` does (clear the live status line) with a
+        human-readable summary: how much audio was transcribed, whether
+        diarization ran, and total wall-clock time since ``_start_time``.
+        Called on the success path only; failures should use ``stop()``.
+        """
+        self._running = False
+        if self.tty:
+            self._thread.join(timeout=2.0)
+        with self._lock:
+            elapsed_str = _format_duration(time.monotonic() - self._start_time)
+            if audio_duration and audio_duration > 0:
+                dur_str = _format_duration(audio_duration)
+            else:
+                dur_str = "unknown-duration"
+            mode = " (with diarization)" if diarized else ""
+            if self.tty:
+                sys.stderr.write("\r\033[K")
+            sys.stderr.write(
+                f"✅ Transcribed {dur_str} of audio{mode} in {elapsed_str}\n"
+            )
+            sys.stderr.flush()
+
+
+def transcribe_file_streaming(
+    file_path: str,
+    server_url: str,
+    reporter: ProgressReporter,
+    language: str = None,
+    output_format: str = "text",
+    diarize: bool = False,
+    num_speakers: int = None,
+):
+    """Consume SSE from the streaming endpoint, forwarding progress lines
+    to *reporter*. Returns the final result payload, or None if the
+    endpoint is 404 (caller should fall back to non-streaming)."""
+    url = server_url.rstrip("/") + STREAM_ENDPOINT
+    with open(file_path, "rb") as f:
+        files = {"file": (os.path.basename(file_path), f, "audio/mpeg")}
+        data = {"response_format": output_format}
+        if language:
+            data["language"] = language
+        if diarize:
+            data["diarize"] = "true"
+            if num_speakers is not None:
+                data["num_speakers"] = str(num_speakers)
+
+        try:
+            resp = requests.post(
+                url, files=files, data=data, stream=True, timeout=(15, 90)
+            )
+        except requests.exceptions.RequestException as e:
+            raise RuntimeError(f"Request failed: {e}")
+
+        if resp.status_code == 404:
+            resp.close()
+            return None
+        if resp.status_code != 200:
+            raise RuntimeError(f"Server returned {resp.status_code}: {resp.text}")
+
+        current_event = None
+        event_data: list = []
+        try:
+            for raw in resp.iter_lines(decode_unicode=True):
+                line = raw if raw is not None else ""
+                if line == "":
+                    if current_event == "result":
+                        return "\n".join(event_data)
+                    elif current_event == "error":
+                        raise RuntimeError("\n".join(event_data))
+                    current_event = None
+                    event_data = []
+                    continue
+                if line.startswith("event:"):
+                    current_event = line.split(":", 1)[1].strip()
+                    event_data = []
+                elif line.startswith("data:"):
+                    payload = line.split(":", 1)[1]
+                    if payload.startswith(" "):
+                        payload = payload[1:]
+                    if current_event == "progress":
+                        reporter.progress(payload)
+                    else:
+                        event_data.append(payload)
+            raise RuntimeError("Stream ended without a result event")
+        finally:
+            resp.close()
 
 
 def main():
@@ -290,6 +559,7 @@ def main():
     args = parser.parse_args()
 
     try:
+        overall_start = time.monotonic()
         with tempfile.TemporaryDirectory() as tmpdir:
             audio_file = obtain_audio(args.input, tmpdir)
 
@@ -324,18 +594,41 @@ def main():
             format_map = {"text": "text", "json": "verbose_json", "srt": "srt"}
             server_format = format_map[args.output_format]
 
-            log(f"Transcribing in {args.output_format} format... (ETA: {est_str})")
-            if args.diarize:
-                log(f"  Diarization enabled (speakers: {args.num_speakers or 'auto'})")
+            if duration > 0:
+                log(f"🎵 Audio duration: {_format_duration(duration)} ({duration:.1f}s)")
 
-            response_text = transcribe_file(
-                audio_file,
-                args.server,
-                args.language,
-                output_format=server_format,
-                diarize=args.diarize,
-                num_speakers=args.num_speakers,
-            )
+            mode = "with diarization" if args.diarize else "without diarization"
+            speakers = ""
+            if args.diarize and args.num_speakers:
+                speakers = f", {args.num_speakers} speakers"
+            log(f"🎧 Transcribing in {args.output_format} format ({mode}{speakers}) — ETA: {est_str}")
+
+            reporter = ProgressReporter(total_duration=duration, start_time=overall_start)
+            response_text = None
+            try:
+                response_text = transcribe_file_streaming(
+                    audio_file,
+                    args.server,
+                    reporter,
+                    language=args.language,
+                    output_format=server_format,
+                    diarize=args.diarize,
+                    num_speakers=args.num_speakers,
+                )
+                if response_text is None:
+                    log("(Streaming endpoint unavailable; falling back to non-streaming)")
+                    response_text = transcribe_file(
+                        audio_file,
+                        args.server,
+                        args.language,
+                        output_format=server_format,
+                        diarize=args.diarize,
+                        num_speakers=args.num_speakers,
+                    )
+            except Exception:
+                reporter.stop()
+                raise
+            reporter.finalize(duration, args.diarize)
 
             if args.output_format == "json":
                 try:
