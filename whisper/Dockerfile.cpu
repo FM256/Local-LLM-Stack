@@ -11,6 +11,9 @@ RUN apt-get update && apt-get install -y \
     wget \
     && rm -rf /var/lib/apt/lists/*
 
+# Bootstrap uv via pip — auditable, no remote script execution.
+RUN pip3 install --no-cache-dir uv
+
 WORKDIR /app
 
 # Build whisper.cpp for CPU (no special flags)
@@ -28,8 +31,8 @@ RUN /app/models/download-ggml-model.sh small /app/models
 # Patch-independent Python packages for the proxy.  Installed before the
 # diarize-patches COPY so that editing the patch does not invalidate the
 # (expensive) torch install layer.
-RUN pip3 install --no-cache-dir fastapi uvicorn python-multipart requests httpx soundfile \
-    && pip3 install --no-cache-dir torch torchaudio --index-url https://download.pytorch.org/whl/cpu
+RUN uv pip install --system --no-cache fastapi uvicorn python-multipart requests httpx soundfile \
+    && uv pip install --system --no-cache torch torchaudio --index-url https://download.pytorch.org/whl/cpu
 
 # diarize is installed from a pinned upstream checkout with a local patch
 # applied at build time (parallel embedding extraction) — see
@@ -38,7 +41,7 @@ ARG DIARIZE_REF=v0.1.2
 COPY diarize-patches /tmp/diarize-patches
 RUN git clone --depth 1 --branch "${DIARIZE_REF}" https://github.com/notch-up/diarize.git /tmp/diarize \
     && cp /tmp/diarize-patches/embeddings.py /tmp/diarize/src/diarize/embeddings.py \
-    && pip3 install --no-cache-dir /tmp/diarize \
+    && uv pip install --system --no-cache /tmp/diarize \
     && rm -rf /tmp/diarize /tmp/diarize-patches
 
 # Copy proxy and entrypoint
