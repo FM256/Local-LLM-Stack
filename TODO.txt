@@ -1,0 +1,6 @@
+- Rename all volume names to be prefixed by llm- for easier overview in docker volumes. However,
+  this will require creating new volumes and migrating the data.
+
+- The ollama container does not contain ffmpeg. This is an issue if a webp image is attached to the model, in which case an error occurs because ffprobe is not in path
+    --> Must self-build on top of this container and install ffmpeg
+    --> Or better yet, build our own llama.cpp based option, which we need to do anyways if we later want to use vulkan
