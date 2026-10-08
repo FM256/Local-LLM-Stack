@@ -22,17 +22,15 @@ MODEL_LISTS = {
     "8gb": [
         "mxbai-embed-large",  # RAG Embedding Model
         "gemma4:e4b",  # Everyday Chat Model - should also be configured for tasks, since loading a separate tasks model causes VRAM pressure and CPU offloading
-        "gemma4:12b",  # More capable chat model (likely offloaded to CPU - slower responses)
+        "qwen3.6:35b",  # More capable chat model (partly offloaded to CPU - slower load times)
         "evalengine/unbound-e4b",
         "laguna-xs-2.1",  # Coding Agent model for harness (Deepseek Harness, Hermes, Open Code, ...)
     ],
     "40gb": [
-        "qwen2.5:3b",  # Simple Task Model (Titles, Queries, ...)
         "mxbai-embed-large",  # RAG Embedding Model
-        "gemma4:12b",  # Scientific general model (weaker/faster version; parallelizable)
-        "gemma4:26b",  # Scientific general model, great for accurate summarizations
+        "gemma4:31b",  # Scientific general model, great for accurate summarizations
         "qwen3.6:35b",  # Powerful Generalist Model for Questions, One-Shot coding, and so on
-        "qwen3.8:27b",  # Powerful agentic coding model from August 2026
+        "qwen3.8:27b",  # Powerful agentic coding and reasoning model from August 2026
     ],
 }
 
