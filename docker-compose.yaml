@@ -29,6 +29,19 @@ services:
     environment:
       #- GLOBAL_LOG_LEVEL=DEBUG
 
+      # Make the view file tool capable of reading whole files. View file is
+      # the cache- and performance friendly way of handling attached files. The
+      # RAG pipeline (inject file context, which can be enabled/disabled in
+      # model settings) is extremely cache busting since it re-adds the file
+      # with every user message and, with that, edits the chat history. This
+      # causes the entire context to be painfully re-ingested with every
+      # prompt. Disabling this setting and relying on the LLM to use the
+      # view_file tool is the performant alternative. However, it can not read
+      # more than 100K chars at a time due to internal webui constraints.
+      - VIEW_FILE_DEFAULT_MAX_CHARS=100000
+      - VIEW_FILE_MAX_CHARS=100000
+      - CHAT_TOOL_MAX_CHARS=100000
+
       # Do not use hugging face, which likes to cause problems. Don't do external connections in general
       - OFFLINE_MODE=true
       - HF_HUB_OFFLINE=1
