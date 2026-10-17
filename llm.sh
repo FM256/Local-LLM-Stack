@@ -20,6 +20,8 @@ parse_config() {
     BIND_PORT="default"
     LOCAL_ONLY=true
     HOSTS=""
+    KEEP_ALIVE="10m"
+    FLASH_ATTENTION="0"
 
     AMD_GPU_TARGET=""
     CUDA_ARCHITECTURES=""
@@ -60,6 +62,7 @@ parse_config() {
 
             case "${current_section}-${key}" in
             general-setup_type) SETUP_TYPE="$val" ;;
+            general-keep_alive) KEEP_ALIVE="$val" ;;
 
             networking-bind_port) BIND_PORT="$val" ;;
             networking-local_only)
@@ -69,6 +72,9 @@ parse_config() {
 
             hardware_gpu-amd_gpu_target) AMD_GPU_TARGET="$val" ;;
             hardware_gpu-cuda_architectures) CUDA_ARCHITECTURES="$val" ;;
+            hardware_gpu-flash_attention)
+                if [[ "$val" == "true" ]]; then FLASH_ATTENTION="1"; else FLASH_ATTENTION="0"; fi
+                ;;
 
             nvidia_mig-mig_device_ollama) MIG_DEVICE_OLLAMA="$val" ;;
             nvidia_mig-mig_device_whisper) MIG_DEVICE_WHISPER="$val" ;;
@@ -104,7 +110,7 @@ parse_config() {
     fi
 
     # Export all needed variables (including HOSTS for the Caddyfile generator)
-    export SETUP_TYPE OPEN_WEBUI_BIND=0.0.0.0:8080 HOSTS CORS_ALLOW_ORIGIN
+    export SETUP_TYPE OPEN_WEBUI_BIND=0.0.0.0:8080 HOSTS CORS_ALLOW_ORIGIN FLASH_ATTENTION KEEP_ALIVE
     if [[ "$SKIP_DB_COPY" == "true" ]]; then export SKIP_DB_COPY=true; fi
 }
 
@@ -352,6 +358,7 @@ else
     ENV_VARS_TO_PASS+=("WEBUI_AUTH=$WEBUI_AUTH")
     ENV_VARS_TO_PASS+=("CORS_ALLOW_ORIGIN=$CORS_ALLOW_ORIGIN")
     ENV_VARS_TO_PASS+=("WEBUI_SECRET_KEY=$WEBUI_SECRET_KEY")
+    ENV_VARS_TO_PASS+=("FLASH_ATTENTION=$FLASH_ATTENTION" "KEEP_ALIVE=$KEEP_ALIVE")
     [[ -n "$AMDGPU_TARGETS" ]] && ENV_VARS_TO_PASS+=("AMDGPU_TARGETS=$AMDGPU_TARGETS" "HSA_OVERRIDE_GFX_VERSION=$HSA_OVERRIDE_GFX_VERSION")
     [[ -n "$CUDA_ARCHITECTURES" ]] && ENV_VARS_TO_PASS+=("CUDA_ARCHITECTURES=$CUDA_ARCHITECTURES")
     [[ -n "$NVIDIA_VISIBLE_DEVICES_OLLAMA" ]] && ENV_VARS_TO_PASS+=("NVIDIA_VISIBLE_DEVICES_OLLAMA=$NVIDIA_VISIBLE_DEVICES_OLLAMA")

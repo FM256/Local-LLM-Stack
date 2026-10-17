@@ -5,6 +5,10 @@
 # Possible values: "cpu", "8gb", "40gb" (default: "8gb")
 setup_type = "8gb"
 
+# How long Ollama keeps a model loaded in memory after the last request.
+# "0" unloads immediately, "-1" keeps forever, or use a duration like "10m", "1h".
+keep_alive = "10m"
+
 [networking]
 # The port(s) for the web UI.
 # - "default": Listens on :80 and redirects to :443 (HTTPS).
@@ -30,6 +34,12 @@ amd_gpu_target = ""
 # Manual override for NVIDIA CUDA compute capabilities used during Whisper build.
 # Possible values: "80", "75;86" or leave empty ("") to use Dockerfile defaults.
 cuda_architectures = ""
+
+# Enable Flash Attention in Ollama (requires a compatible GPU backend).
+# Gains scale with context length. Can increase peak VRAM usage; disable if you
+# see VRAM pressure, spilling to CPU, or instability on ROCm.
+# Possible values: "true", "false" (default: "false")
+flash_attention = "false"
 
 [nvidia_mig]
 # In case NVIDIA MIG (Multi-Instance GPU) is enabled, you must assign specific MIG Instances (UUIDs)

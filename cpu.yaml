@@ -8,6 +8,8 @@ services:
       - ollama-data:/root/.ollama
     environment:
       - OLLAMA_CONTEXT_LENGTH=32768   # Context length for when you run ollama from the terminal (webui will override it). Default of 4096 is relatively small
+      - OLLAMA_FLASH_ATTENTION=${FLASH_ATTENTION:-0}   # No-op on CPU; kept for config consistency
+      - OLLAMA_KEEP_ALIVE=${KEEP_ALIVE:-10m}
     networks: # Reachable on port 11434
       - llm-network
 

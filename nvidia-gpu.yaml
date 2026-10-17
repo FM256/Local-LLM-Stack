@@ -11,6 +11,8 @@ services:
       - ollama-data:/root/.ollama
     environment:
       - OLLAMA_CONTEXT_LENGTH=32768
+      - OLLAMA_FLASH_ATTENTION=${FLASH_ATTENTION:-0}
+      - OLLAMA_KEEP_ALIVE=${KEEP_ALIVE:-10m}
       - NVIDIA_VISIBLE_DEVICES=${NVIDIA_VISIBLE_DEVICES_OLLAMA:-all}
     runtime: nvidia
     deploy:

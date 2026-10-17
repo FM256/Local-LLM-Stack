@@ -21,6 +21,8 @@ services:
       # llm.sh for a usage example, it uses it to automatically determine these versions
       HSA_OVERRIDE_GFX_VERSION: ${HSA_OVERRIDE_GFX_VERSION}
       OLLAMA_CONTEXT_LENGTH: 32768   # Context length for when you run ollama from the terminal (webui will override it). Default of 4096 is relatively small
+      OLLAMA_FLASH_ATTENTION: ${FLASH_ATTENTION:-0}
+      OLLAMA_KEEP_ALIVE: ${KEEP_ALIVE:-10m}
     # AMD users: Pass the graphic devices directly; will be accessed by the internal rocm
     devices:
       - /dev/kfd
