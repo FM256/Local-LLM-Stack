@@ -79,6 +79,7 @@ services:
 
       # Feature Settings
       - ENABLE_FOLLOW_UP_GENERATION=false
+      - WEBUI_THEME=dark
 
       # Default model settings
       - DEFAULT_CONTEXT_LENGTH=32768 # Default of 2048 is laughably small and quickly causes issues
