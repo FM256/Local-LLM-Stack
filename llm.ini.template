@@ -9,6 +9,26 @@ setup_type = "8gb"
 # "0" unloads immediately, "-1" keeps forever, or use a duration like "10m", "1h".
 keep_alive = "10m"
 
+# Total Host-RAM budget (MiB) for llama.cpp's prompt-state cache, forwarded to the
+# Ollama container as LLAMA_ARG_CACHE_RAM. This is the "extra slots" cache
+# that lets a finished prompt's KV state be restored when another request
+# claims the active slot. Without enough headroom, a small aux call evicts a
+# large prompt's state and the next turn pays a full re-prefill.
+# Default 8192 is llama.cpp's own default. Raise on high-RAM hosts (e.g.
+# "65536" for 64 GiB) if you run very long contexts alongside mid-turn calls.
+cache_ram = "8192"
+
+# For models with certain memory-efficient kv cache architecture, use a
+# sliding-window-attention (SWA) KV cache instead of the compact window.
+# Forwarded to the Ollama container as LLAMA_ARG_SWA_FULL. With the compact
+# window (the default), SWA and hybrid/recurrent models invalidate context
+# checkpoints as the window advances, which forces a full prompt re-prefill on
+# cache reuse — the log line to look for is "erased invalidated context
+# checkpoint ... forcing full prompt re-processing". A full-size SWA cache
+# keeps checkpoints reusable at the cost of more RAM. No-op on models without
+# SWA. Possible values: "true", "false" (default)
+swa_full = "false"
+
 [networking]
 # The port(s) for the web UI.
 # - "default": Listens on :80 and redirects to :443 (HTTPS).

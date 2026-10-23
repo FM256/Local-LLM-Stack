@@ -14,6 +14,14 @@ services:
       - OLLAMA_FLASH_ATTENTION=${FLASH_ATTENTION:-0}
       - OLLAMA_KEEP_ALIVE=${KEEP_ALIVE:-10m}
       - NVIDIA_VISIBLE_DEVICES=${NVIDIA_VISIBLE_DEVICES_OLLAMA:-all}
+      # llama.cpp prompt-state cache budget (MiB). Ollama forwards LLAMA_ARG_*
+      # straight to its llama-server child, overriding llama.cpp's 8192 MiB
+      # default. Larger = fewer full re-prefills when an aux call claims the slot.
+      - LLAMA_ARG_CACHE_RAM=${CACHE_RAM:-8192}
+      # Full-size SWA KV cache. Costs more ram, but without this, SWA/hybrid models invalidate
+      # context checkpoints as the window advances and force full prompt
+      # reprocessing on reuse. No-op on non-SWA models.
+      - LLAMA_ARG_SWA_FULL=${SWA_FULL:-0}
     runtime: nvidia
     deploy:
       resources:
